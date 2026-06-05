@@ -1,0 +1,163 @@
+package com.interfaces;
+
+import com.lowagie.text.pdf.AcroFields;
+import com.lowagie.text.pdf.PRStream;
+import com.lowagie.text.pdf.PdfDictionary;
+import com.lowagie.text.pdf.PdfName;
+import com.lowagie.text.pdf.PdfReader;
+import com.lowagie.text.pdf.PdfStamper;
+import com.lowagie.text.pdf.PdfString;
+
+import org.apache.pdfbox.pdmodel.PDDocument;
+import org.apache.pdfbox.pdmodel.PDPage;
+import org.apache.pdfbox.pdmodel.PDPageContentStream;
+import org.apache.pdfbox.pdmodel.common.PDRectangle;
+import org.apache.pdfbox.pdmodel.graphics.image.LosslessFactory;
+import org.apache.pdfbox.pdmodel.graphics.image.PDImageXObject;
+import org.apache.pdfbox.rendering.ImageType;
+import org.apache.pdfbox.rendering.PDFRenderer;
+
+import java.awt.image.BufferedImage;
+import java.io.ByteArrayOutputStream;
+import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+/*
+PDF original (com campos + fontes erradas)
+			↓  flattenWithIText
+PDF achatado em memória (fontes corrigidas, campos estáticos)
+			↓  rasterizeToFile
+PDF final salvo em disco (cada página = imagem rasterizada)
+*/
+
+public class PDFFlatten {
+
+    private static final String CORRECT_FONT = "/TiRo";
+    private static final String CORRECT_SIZE = "10";
+    private static final int    MOBILE_DPI   = 200;
+
+    private static final Pattern TF_PATTERN =
+            Pattern.compile("(/\\w+)\\s+([\\d.]+)\\s+Tf");
+
+    public String flattenFields(String pathSource, String pathTarget) {
+        try {
+            // === PASSO 1: flatten iText com correção de fonte ===
+            byte[] flatBytes = flattenWithIText(pathSource);
+            if (flatBytes == null)
+                throw new Exception("Erro ao achatar campos do formulário");
+
+            // === PASSO 2: rasteriza com PDFBox para garantir fontes em mobile ===
+            rasterizeToFile(flatBytes, pathTarget, MOBILE_DPI);
+
+            return "";
+
+        } catch (Exception e) {
+            return e.getMessage();
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private byte[] flattenWithIText(String pathSource) throws Exception {
+        PdfReader reader = new PdfReader(pathSource);
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        PdfStamper stamper = new PdfStamper(reader, baos);
+
+        AcroFields fields = stamper.getAcroFields();
+
+        Map<String, AcroFields.Item> fieldMap = fields.getFields();
+        for (Map.Entry<String, AcroFields.Item> entry : fieldMap.entrySet()) {
+            AcroFields.Item item = entry.getValue();
+            for (int i = 0; i < item.size(); i++) {
+
+                PdfDictionary merged = item.getMerged(i);
+                if (merged == null) continue;
+
+                // Corrige DA
+                PdfString daStr = merged.getAsString(PdfName.DA);
+                if (daStr != null) {
+                    String da = daStr.toString();
+                    String fixedDa = TF_PATTERN.matcher(da)
+                            .replaceAll(CORRECT_FONT + " " + CORRECT_SIZE + " Tf");
+                    if (!fixedDa.equals(da)) {
+                        merged.put(PdfName.DA, new PdfString(fixedDa));
+                        PdfDictionary widget = item.getWidget(i);
+                        if (widget != null)
+                            widget.put(PdfName.DA, new PdfString(fixedDa));
+                    }
+                }
+
+                // Corrige AP stream
+                PdfDictionary widget = item.getWidget(i);
+                if (widget == null) continue;
+                PdfDictionary ap = widget.getAsDict(PdfName.AP);
+                if (ap == null) continue;
+
+                com.lowagie.text.pdf.PdfObject nObj = ap.get(PdfName.N);
+                if (nObj == null) continue;
+
+                com.lowagie.text.pdf.PdfObject resolved =
+                        PdfReader.getPdfObject(nObj);
+                if (!(resolved instanceof PRStream)) continue;
+
+                PRStream stream = (PRStream) resolved;
+                byte[] streamBytes = PdfReader.getStreamBytes(stream);
+                String streamText = new String(streamBytes, "ISO-8859-1");
+
+                Matcher m = TF_PATTERN.matcher(streamText);
+                StringBuffer sb = new StringBuffer();
+                boolean changed = false;
+                while (m.find()) {
+                    if (!m.group(1).equals(CORRECT_FONT)
+                            || !m.group(2).equals(CORRECT_SIZE)) {
+                        m.appendReplacement(sb,
+                                CORRECT_FONT + " " + CORRECT_SIZE + " Tf");
+                        changed = true;
+                    } else {
+                        m.appendReplacement(sb, m.group(0));
+                    }
+                }
+                m.appendTail(sb);
+
+                if (changed)
+                    stream.setData(sb.toString().getBytes("ISO-8859-1"));
+            }
+        }
+
+        //Transforma os campos interativos em conteúdo estático — sem isso, viewers 
+        //mobile podem ignorar o AP e renderizar com fonte padrão do sistema.
+        stamper.setFormFlattening(true);
+        stamper.close();
+        reader.close();
+
+        return baos.toByteArray();
+    }
+
+    //Mesmo após o flatten do iText, alguns viewers Android/iOS ainda tentam reinterpretar 
+    //os campos ou substituem fontes. Ao converter tudo para imagem, elimina-se qualquer 
+    //possibilidade de renderização incorreta — o que você vê no PDF é exatamente a imagem gerada no servidor.
+    private void rasterizeToFile(byte[] pdfBytes, String pathTarget, int dpi)
+            throws Exception {
+        PDDocument document = PDDocument.load(pdfBytes);
+        PDFRenderer renderer = new PDFRenderer(document);
+        PDDocument output = new PDDocument();
+
+        for (int i = 0; i < document.getNumberOfPages(); i++) {
+            BufferedImage image = renderer.renderImageWithDPI(i, dpi, ImageType.RGB);
+
+            PDPage page = new PDPage(
+                    new PDRectangle(image.getWidth(), image.getHeight()));
+            output.addPage(page);
+
+            PDImageXObject pdImage = LosslessFactory.createFromImage(output, image);
+
+            try (PDPageContentStream cs =
+                    new PDPageContentStream(output, page)) {
+                cs.drawImage(pdImage, 0, 0, image.getWidth(), image.getHeight());
+            }
+        }
+
+        output.save(pathTarget);
+        output.close();
+        document.close();
+    }
+}
