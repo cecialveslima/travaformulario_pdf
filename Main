@@ -1,0 +1,28 @@
+package com.interfaces;
+
+public class Main {
+
+    public static void main(String[] args) {
+        if (args.length < 2) {
+            System.out.println("Uso: java Main <arquivo_entrada.pdf> <arquivo_saida.pdf>");
+            System.out.println("Exemplo: java Main formulario.pdf formulario_flat.pdf");
+            return;
+        }
+
+        String pathSource = args[0];
+        String pathTarget = args[1];
+
+        System.out.println("Origem : " + pathSource);
+        System.out.println("Destino: " + pathTarget);
+        System.out.println("Processando...");
+
+        PDFFlatten flatten = new PDFFlatten();
+        String result = flatten.flattenFields(pathSource, pathTarget);
+
+        if (result == null || result.isEmpty()) {
+            System.out.println("Concluido com sucesso.");
+        } else {
+            System.out.println("ERRO: " + result);
+        }
+    }
+}
